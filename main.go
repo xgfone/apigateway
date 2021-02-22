@@ -15,6 +15,8 @@
 package main
 
 import (
+	"net/http"
+
 	"github.com/xgfone/apigw"
 	"github.com/xgfone/gconf/v5"
 	"github.com/xgfone/go-tools/v7/lifecycle"
@@ -25,16 +27,30 @@ import (
 	"github.com/xgfone/ship/v3/middleware"
 )
 
-const appName = "apigw"
+const appName = "apigateway"
 
 var globalOpts = []gconf.Opt{
 	gconf.StrOpt("manageraddr", "The address [HOST]:PORT that the api manager listens on."),
 	gconf.StrOpt("gatewayaddr", "The address [HOST]:PORT that the api gateway listens on.").D(":80"),
 }
 
+var httpOpts = []gconf.Opt{
+	gconf.IntOpt("maxidleconnsperhost", "The maximum number of the idle connections per host.").D(100),
+	gconf.DurationOpt("idleconntimeout", "The timeout of the idle connection.").D("30s"),
+}
+
+func init() {
+	gconf.NewGroup("http").RegisterOpts(httpOpts...)
+}
+
 func main() {
 	// Parse the CLI arguments and initialize the logging.
 	goapp.Init(appName, globalOpts)
+
+	// Initialize the http transport.
+	tp := http.DefaultTransport.(*http.Transport)
+	tp.MaxIdleConnsPerHost = gconf.Group("http").GetInt("maxidleconnsperhost")
+	tp.IdleConnTimeout = gconf.Group("http").GetDuration("idleconntimeout")
 
 	// Initialize the api gateway instance.
 	gw := apigw.NewGateway()

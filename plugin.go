@@ -15,6 +15,8 @@
 package main
 
 import (
+	"fmt"
+
 	"github.com/xgfone/apigw"
 	"github.com/xgfone/apigw/loader"
 	"github.com/xgfone/gconf/v5"
@@ -22,11 +24,11 @@ import (
 	"github.com/xgfone/goapp/log"
 )
 
-func init() {
+func registerPluginOpts() {
 	gconf.RegisterOpts(
-		gconf.StrSliceOpt("plugins", "The list of the names of the plugins to be enabled."),
-		gconf.StrSliceOpt("middlewares", "The list of the names of the middlewares to be enabled."),
-		gconf.StrSliceOpt("sds", "The list of the names of the service discoveries to be enabled."),
+		gconf.StrSliceOpt("plugins", fmt.Sprintf("The list of the names of the plugins to be enabled. Availables: %v.", loader.GetPluginLoaders())),
+		gconf.StrSliceOpt("middlewares", fmt.Sprintf("The list of the names of the middlewares to be enabled. Availables: %v.", loader.GetMiddlewareLoaders())),
+		gconf.StrSliceOpt("sds", fmt.Sprintf("The list of the names of the service discoveries to be enabled. Availables: %v.", loader.GetServiceDiscoveryLoaders())),
 	)
 }
 

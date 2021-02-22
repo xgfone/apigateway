@@ -28,28 +28,17 @@ var (
 	sdDllDirEnvName         = strings.ToUpper(appName) + "_SD_DLL_DIRS"
 )
 
-var (
-	middlewareDLLs []dllInfo
-	pluginDLLs     []dllInfo
-	sdDLLs         []dllInfo
-)
-
-type dllInfo struct {
-	*stdplugin.Plugin
-	Path string
-}
-
 func init() {
 	var err error
 	for _, env := range os.Environ() {
 		if index := strings.IndexByte(env, '='); index > 0 {
 			switch env[:index] {
 			case middlewareDllDirEnvName:
-				middlewareDLLs, err = getDLLsFromDirs(env[index+1:])
+				err = loadDLLsFromDirs(env[index+1:])
 			case pluginDllDirEnvName:
-				pluginDLLs, err = getDLLsFromDirs(env[index+1:])
+				err = loadDLLsFromDirs(env[index+1:])
 			case sdDllDirEnvName:
-				sdDLLs, err = getDLLsFromDirs(env[index+1:])
+				err = loadDLLsFromDirs(env[index+1:])
 			}
 
 			if err != nil {
@@ -57,18 +46,18 @@ func init() {
 			}
 		}
 	}
+
+	registerPluginOpts()
 }
 
-func getDLLsFromDirs(d string) (dlls []dllInfo, err error) {
-	var dll *stdplugin.Plugin
+func loadDLLsFromDirs(d string) (err error) {
 	for _, dir := range strings.Split(d, ",") {
 		if dir = strings.TrimSpace(dir); dir != "" {
 			err = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
 				if err == nil && strings.HasSuffix(info.Name(), ".so") {
-					if dll, err = stdplugin.Open(path); err != nil {
+					if _, err = stdplugin.Open(path); err != nil {
 						return fmt.Errorf("fail to open the dll '%s': %v", path, err)
 					}
-					dlls = append(dlls, dllInfo{Plugin: dll, Path: path})
 				}
 				return err
 			})
