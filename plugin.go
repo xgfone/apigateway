@@ -60,7 +60,7 @@ func registerMiddlewares(gw *apigw.Gateway) {
 			log.Fatal("fail to load the middleware", log.F("middleware", name), log.E(err))
 		}
 
-		gw.RegisterMiddlewares(mw)
+		gw.RegisterGlobalMiddlewares(mw)
 	}
 }
 
