@@ -15,30 +15,27 @@
 package main
 
 import (
-	"time"
-
 	"github.com/xgfone/apigateway/backend"
 	"github.com/xgfone/apigw"
 	"github.com/xgfone/apigw/forward/lb"
-	"github.com/xgfone/go-service/loadbalancer"
-	"github.com/xgfone/go-tools/v7/lifecycle"
+	"github.com/xgfone/gconf/v5"
 	"github.com/xgfone/ship/v3"
 )
 
-var hc *loadbalancer.HealthCheck
-
-func init() {
-	hc = loadbalancer.NewHealthCheck()
-	hc.Interval = time.Second * 10
-	lifecycle.Register(hc.Stop)
+var routeOpts = []gconf.Opt{
+	gconf.DurationOpt("maxtimeout", "The maximum timeout to forward the request to the backend").D("1m"),
 }
 
-func initAdminRouter(r *ship.Ship, gw *apigw.Gateway) {
-	c := adminController{gateway: gw}
+func init() { gconf.RegisterOpts(routeOpts...) }
+
+func initAdminRouter(r *ship.Ship) {
+	backend.DefaultForwarderMaxTimeout = gconf.MustDuration("maxtimeout")
+	c := adminController{}
 
 	v1admin := r.Group("/v1/admin")
 	v1admin.Route("/host").
 		GET(c.GetAllDomains).
+		POST(c.CreateDomain).
 		DELETE(c.DeleteDomain)
 	v1admin.Route("/host/route").
 		GET(c.GetAllDomainRoutes).
@@ -59,18 +56,30 @@ func initAdminRouter(r *ship.Ship, gw *apigw.Gateway) {
 	v1adminUnderlying.Route("/endpoints").GET(c.GetAllUnderlyingEndpoints)
 }
 
-type adminController struct {
-	gateway *apigw.Gateway
-	timeout time.Duration
+type adminController struct{}
+
+func (c adminController) sendError(host, path, method string, err error) error {
+	switch err {
+	case nil:
+		return nil
+	case apigw.ErrNoHost:
+		return ship.ErrBadRequest.Newf("no host '%s'", host)
+	case apigw.ErrNoRoute:
+		return ship.ErrBadRequest.Newf("no route: host=%s, path=%s, method=%s", host, path, method)
+	case apigw.ErrEmptyPath:
+		return ship.ErrBadRequest.Newf("the path must not be empty")
+	default:
+		return ship.ErrInternalServerError.New(err)
+	}
 }
 
 func (c adminController) GetAllUnderlyingHosts(ctx *ship.Context) (err error) {
-	routers := c.gateway.Router().Routers()
+	routers := lb.DefaultGateway.Router().Routers()
 	hosts := make([]string, 0, len(routers))
 	for host := range routers {
 		hosts = append(hosts, host)
 	}
-	return ctx.JSON(200, map[string][]string{"hosts": c.gateway.GetHosts()})
+	return ctx.JSON(200, map[string][]string{"hosts": hosts})
 }
 
 func (c adminController) GetAllUnderlyingRoutes(ctx *ship.Context) (err error) {
@@ -82,7 +91,7 @@ func (c adminController) GetAllUnderlyingRoutes(ctx *ship.Context) (err error) {
 	}
 
 	var routes []apigw.Route
-	if router := c.gateway.Router().Router(req.Host); router != nil {
+	if router := lb.DefaultGateway.Router().Router(req.Host); router != nil {
 		rs := router.Routes()
 		routes = make([]apigw.Route, len(rs))
 		for i, _len := 0, len(rs); i < _len; i++ {
@@ -94,16 +103,17 @@ func (c adminController) GetAllUnderlyingRoutes(ctx *ship.Context) (err error) {
 }
 
 func (c adminController) GetAllUnderlyingEndpoints(ctx *ship.Context) (err error) {
-	endpoints := hc.Endpoints()
+	endpoints := backend.HC.Endpoints()
 	eps := make([]map[string]interface{}, len(endpoints))
 	for i, _len := 0, len(endpoints); i < _len; i++ {
 		ep := endpoints[i]
-
+		metadata := ep.MetaData()
+		metadata["online"] = backend.HC.IsHealthy(ep.String())
 		eps[i] = map[string]interface{}{
 			"type":            ep.Type(),
-			"metadata":        ep.MetaData(),
 			"userdata":        ep.UserData(),
-			"reference_count": hc.ReferenceCount(ep.String()),
+			"metadata":        metadata,
+			"reference_count": backend.HC.ReferenceCount(ep.String()),
 		}
 	}
 	return ctx.JSON(200, map[string]interface{}{"endpoints": eps})
@@ -118,13 +128,13 @@ func (c adminController) GetBackendGroup(ctx *ship.Context) (err error) {
 		return ship.ErrBadRequest.New(err)
 	}
 
-	m := lb.GetBackendGroupManager(req.Host)
+	m := lb.DefaultGateway.GetBackendGroupManager(req.Host)
 	if m == nil {
-		return ship.ErrBadRequest.Newf("no the host '%s'", req.Host)
+		return ship.ErrBadRequest.Newf("no host '%s'", req.Host)
 	}
 
 	if req.BackendGroup == "" {
-		bgs := m.BackendGroups()
+		bgs := m.GetBackendGroups()
 		gs := make([]string, len(bgs))
 		for i, _len := 0, len(bgs); i < _len; i++ {
 			gs[i] = bgs[i].Name()
@@ -132,12 +142,12 @@ func (c adminController) GetBackendGroup(ctx *ship.Context) (err error) {
 		return ctx.JSON(200, map[string]interface{}{"backend_groups": gs})
 	}
 
-	bg := m.BackendGroup(req.BackendGroup)
+	bg := m.GetBackendGroup(req.BackendGroup)
 	if bg == nil {
 		return ship.ErrBadRequest.Newf("no backend group named '%s'", req.BackendGroup)
 	}
 
-	backends := bg.Backends()
+	backends := bg.GetBackends()
 	bs := make(backend.Backends, len(backends))
 	for i, _len := 0, len(backends); i < _len; i++ {
 		b := backends[i]
@@ -160,7 +170,13 @@ func (c adminController) GetBackendGroup(ctx *ship.Context) (err error) {
 		}
 	}
 
-	return ctx.JSON(200, map[string]interface{}{"backends": bs})
+	updaters := bg.GetUpdaters()
+	forwarders := make([]string, len(updaters))
+	for i, _len := 0, len(updaters); i < _len; i++ {
+		forwarders[i] = updaters[i].Name()
+	}
+
+	return ctx.JSON(200, map[string]interface{}{"backends": bs, "forwarders": forwarders})
 }
 
 func (c adminController) CreateBackendGroup(ctx *ship.Context) (err error) {
@@ -175,13 +191,22 @@ func (c adminController) CreateBackendGroup(ctx *ship.Context) (err error) {
 		return ship.ErrBadRequest.New(err)
 	}
 
-	m := lb.RegisterBackendGroupManager(lb.NewBackendGroupManager(req.Host))
+	m := lb.DefaultGateway.GetBackendGroupManager(req.Host)
+	if m == nil {
+		return ship.ErrBadRequest.Newf("no host '%s'", req.Host)
+	}
+
+	conf := &lb.GroupBackendConfig{IsHealthy: backend.IsHealthy}
 	for _, bg := range req.BackendGroups {
 		backends, err := bg.Backends.Backends(apigw.Route{Host: req.Host})
 		if err != nil {
 			return ship.ErrBadRequest.New(err)
 		}
-		m.Add(lb.NewBackendGroup(bg.Name)).AddBackends(backends)
+
+		group := m.AddOrNewBackendGroup(bg.Name, conf)
+		for _, backend := range backends {
+			group.AddBackend(backend)
+		}
 	}
 
 	return
@@ -199,23 +224,20 @@ func (c adminController) DeleteBackendGroup(ctx *ship.Context) (err error) {
 		return ship.ErrBadRequest.New(err)
 	}
 
-	if len(req.BackendGroups) == 0 {
-		lb.UnregisterBackendGroupManager(req.Host)
-		return
-	}
-
-	m := lb.GetBackendGroupManager(req.Host)
+	m := lb.DefaultGateway.GetBackendGroupManager(req.Host)
 	if m == nil {
-		return
+		return ship.ErrBadRequest.Newf("no host '%s'", req.Host)
 	}
 
 	for _, bg := range req.BackendGroups {
 		if len(bg.Backends) == 0 {
-			m.Delete(bg.Name)
+			m.DelBackendGroupByName(bg.Name)
 		} else if backends, err := bg.Backends.Backends(apigw.Route{Host: req.Host}); err != nil {
 			return ship.ErrBadRequest.New(err)
-		} else if g := m.BackendGroup(bg.Name); g != nil {
-			g.DelBackends(backends)
+		} else if g := m.GetBackendGroup(bg.Name); g != nil {
+			for _, backend := range backends {
+				g.DelBackend(backend)
+			}
 		}
 	}
 
@@ -223,7 +245,17 @@ func (c adminController) DeleteBackendGroup(ctx *ship.Context) (err error) {
 }
 
 func (c adminController) GetAllDomains(ctx *ship.Context) (err error) {
-	return ctx.JSON(200, map[string][]string{"hosts": c.gateway.GetHosts()})
+	return ctx.JSON(200, map[string][]string{"hosts": lb.DefaultGateway.GetHosts()})
+}
+
+func (c adminController) CreateDomain(ctx *ship.Context) (err error) {
+	var req struct {
+		Host string `json:"host" validate:"zero|hostname_rfc1123"`
+	}
+	if err = ctx.Bind(&req); err != nil {
+		return ship.ErrBadRequest.New(err)
+	}
+	return lb.DefaultGateway.AddHost(req.Host)
 }
 
 func (c adminController) DeleteDomain(ctx *ship.Context) (err error) {
@@ -233,7 +265,7 @@ func (c adminController) DeleteDomain(ctx *ship.Context) (err error) {
 	if err = ctx.BindQuery(&req); err != nil {
 		return ship.ErrBadRequest.New(err)
 	}
-	return c.gateway.DelHost(req.Host)
+	return lb.DefaultGateway.DelHost(req.Host)
 }
 
 func (c adminController) GetAllDomainRoutes(ctx *ship.Context) (err error) {
@@ -244,7 +276,10 @@ func (c adminController) GetAllDomainRoutes(ctx *ship.Context) (err error) {
 		return ship.ErrBadRequest.New(err)
 	}
 
-	routes := c.gateway.GetRoutes(req.Host)
+	routes, err := lb.DefaultGateway.GetRoutes(req.Host)
+	if err != nil {
+		return c.sendError(req.Host, "", "", err)
+	}
 	return ctx.JSON(200, map[string][]apigw.Route{"routes": routes})
 }
 
@@ -265,19 +300,12 @@ func (c adminController) AddDomainRoute(ctx *ship.Context) (err error) {
 		return ship.ErrBadRequest.New(err)
 	}
 
-	forwarder := lb.NewForwarder(r.Name(), c.timeout)
-	forwarder.HealthCheck = hc
-	r.Forwarder = forwarder
-	if r.Route, err = c.gateway.RegisterRoute(r.Route); err != nil {
+	r.Forwarder = backend.NewForwarder(r.Name(), 0)
+	if r.Route, err = lb.DefaultGateway.RegisterRoute(r.Route); err != nil {
 		return ship.ErrBadRequest.New(err)
 	}
 
-	forwarder = r.Route.Forwarder.(*lb.Forwarder)
-	if forwarder.Session == nil {
-		forwarder.Session = loadbalancer.NewMemorySessionManager()
-	}
-
-	forwarder.AddBackends(backends)
+	r.Route.Forwarder.(lb.Forwarder).AddBackends(backends...)
 	return
 }
 
@@ -289,7 +317,7 @@ func (c adminController) DelDomainRoute(ctx *ship.Context) (err error) {
 		return ship.ErrBadRequest.Newf("missing path or method")
 	}
 
-	if _, err = c.gateway.UnregisterRoute(r); err != nil {
+	if _, err = lb.DefaultGateway.UnregisterRoute(r); err != nil {
 		return ship.ErrBadRequest.New(err)
 	}
 
@@ -306,16 +334,14 @@ func (c adminController) GetAllDomainRouteBackends(ctx *ship.Context) (err error
 		return ship.ErrBadRequest.New(err)
 	}
 
-	r, ok := c.gateway.GetRoute(req.Host, req.Path, req.Method)
-	if !ok {
-		return ctx.JSON(200, map[string][]interface{}{"backends": {}})
+	bs, err := lb.DefaultGateway.GetRouteBackends(req.Host, req.Path, req.Method)
+	if err != nil {
+		return c.sendError(req.Host, req.Path, req.Method, err)
 	}
 
-	forwarder := r.Forwarder.(*lb.Forwarder)
-	backends := forwarder.Backends()
-	results := make([]backend.Backend, len(backends))
-	for i, _len := 0, len(backends); i < _len; i++ {
-		b := backends[i].(lb.Backend)
+	backends := make([]backend.Backend, len(bs))
+	for i, _len := 0, len(bs); i < _len; i++ {
+		b := bs[i].(lb.Backend)
 
 		var interval, timeout string
 		hc := b.HealthCheck()
@@ -326,7 +352,7 @@ func (c adminController) GetAllDomainRouteBackends(ctx *ship.Context) (err error
 			timeout = hc.Timeout.String()
 		}
 
-		results[i] = backend.Backend{
+		backends[i] = backend.Backend{
 			Type:     b.Type(),
 			Metadata: b.MetaData(),
 			RetryNum: hc.RetryNum,
@@ -335,19 +361,7 @@ func (c adminController) GetAllDomainRouteBackends(ctx *ship.Context) (err error
 		}
 	}
 
-	if m := lb.GetBackendGroupManager(req.Host); m != nil {
-		bgs := m.BackendGroupsByUpdaterName(forwarder.Name())
-		if _len := len(bgs); _len != 0 {
-			for i := 0; i < _len; i++ {
-				results = append(results, backend.Backend{
-					Type:     "group",
-					Metadata: map[string]interface{}{"name": bgs[i].Name()},
-				})
-			}
-		}
-	}
-
-	return ctx.JSON(200, map[string]interface{}{"backends": results})
+	return ctx.JSON(200, map[string]interface{}{"backends": backends})
 }
 
 func (c adminController) AddDomainRouteBackend(ctx *ship.Context) (err error) {
@@ -369,18 +383,8 @@ func (c adminController) AddDomainRouteBackend(ctx *ship.Context) (err error) {
 		return ship.ErrBadRequest.New(err)
 	}
 
-	if !c.gateway.HasHost(req.Host) {
-		return ship.ErrBadRequest.Newf("no host '%s'", req.Host)
-	}
-
-	r, ok := c.gateway.GetRoute(req.Host, req.Path, req.Method)
-	if !ok {
-		return ship.ErrBadRequest.Newf("no host route: host=%s, path=%s, method=%s",
-			req.Host, req.Path, req.Method)
-	}
-
-	r.Forwarder.(*lb.Forwarder).AddBackends(backends)
-	return
+	err = lb.DefaultGateway.AddRouteBackends(req.Host, req.Path, req.Method, backends...)
+	return c.sendError(req.Host, req.Path, req.Method, err)
 }
 
 func (c adminController) DelDomainRouteBackend(ctx *ship.Context) (err error) {
@@ -402,16 +406,6 @@ func (c adminController) DelDomainRouteBackend(ctx *ship.Context) (err error) {
 		return ship.ErrBadRequest.New(err)
 	}
 
-	if !c.gateway.HasHost(req.Host) {
-		return ship.ErrBadRequest.Newf("no host '%s'", req.Host)
-	}
-
-	r, ok := c.gateway.GetRoute(req.Host, req.Path, req.Method)
-	if !ok {
-		return ship.ErrBadRequest.Newf("no host route: host=%s, path=%s, method=%s",
-			req.Host, req.Path, req.Method)
-	}
-
-	r.Forwarder.(*lb.Forwarder).DelBackends(backends)
-	return
+	err = lb.DefaultGateway.DelRouteBackends(req.Host, req.Path, req.Method, backends...)
+	return c.sendError(req.Host, req.Path, req.Method, err)
 }

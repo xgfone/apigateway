@@ -17,7 +17,7 @@ package main
 import (
 	"net/http"
 
-	"github.com/xgfone/apigw"
+	"github.com/xgfone/apigw/forward/lb"
 	"github.com/xgfone/gconf/v5"
 	"github.com/xgfone/go-tools/v7/lifecycle"
 	"github.com/xgfone/goapp"
@@ -53,16 +53,16 @@ func main() {
 	tp.IdleConnTimeout = gconf.Group("http").GetDuration("idleconntimeout")
 
 	// Initialize the api gateway instance.
-	gw := apigw.NewGateway()
+	gw := lb.DefaultGateway
 	gw.Router().Name = "gateway"
 	gw.Router().SetLogger(log.GetDefaultLogger())
 	gw.Router().RegisterOnShutdown(lifecycle.Stop)
 	lifecycle.Register(gw.Router().Stop)
 
 	// Register the route plugins and middlewres, and start the service discoveries.
-	registerPlugins(gw)
-	registerMiddlewares(gw)
-	startServiceDiscoveries(gw)
+	registerPlugins(gw.Gateway)
+	registerMiddlewares(gw.Gateway)
+	startServiceDiscoveries(gw.Gateway)
 
 	// Start the api manager server.
 	if maddr := gconf.MustString("manageraddr"); maddr != "" {
@@ -73,7 +73,7 @@ func main() {
 		mapp.Use(middleware.Logger(), router.Recover)
 		mapp.SetLogger(log.GetDefaultLogger())
 		router.AddRuntimeRoutes(mapp)
-		initAdminRouter(mapp, gw)
+		initAdminRouter(mapp)
 		go mapp.Start(maddr)
 	}
 

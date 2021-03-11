@@ -26,9 +26,44 @@ import (
 	"github.com/xgfone/apigw/forward/lb"
 	"github.com/xgfone/apigw/forward/lb/backend"
 	"github.com/xgfone/go-service/loadbalancer"
+	"github.com/xgfone/go-tools/v7/lifecycle"
 	"github.com/xgfone/go-tools/v7/strings2"
 	"github.com/xgfone/ship/v3"
 )
+
+// HC is the global health checker.
+var HC *loadbalancer.HealthCheck
+
+// DefaultForwarderMaxTimeout is the default maximum timeout of the forwarder.
+var DefaultForwarderMaxTimeout time.Duration
+
+func init() {
+	HC = loadbalancer.NewHealthCheck()
+	HC.Interval = time.Second * 10
+	lifecycle.Register(HC.Stop)
+}
+
+// NewForwarder returns a new backend forwarder.
+//
+// If maxTimeout is ZERO, it is equal to DefaultForwarderMaxTimeout by default.
+func NewForwarder(name string, maxTimeout time.Duration) lb.Forwarder {
+	if maxTimeout == 0 {
+		maxTimeout = DefaultForwarderMaxTimeout
+	}
+
+	return lb.NewForwarder(name, &lb.ForwarderConfig{
+		MaxTimeout:  maxTimeout,
+		HealthCheck: HC,
+		UpdateLoadBalancer: func(lb *loadbalancer.LoadBalancer) {
+			lb.Session = loadbalancer.NewMemorySessionManager()
+		},
+	})
+}
+
+// IsHealthy reports whether the backend is healthy.
+func IsHealthy(backend lb.Backend) bool {
+	return HC.IsHealthy(backend.String())
+}
 
 // Backend is the backend of the route.
 type Backend struct {
@@ -93,15 +128,13 @@ func init() {
 			return nil, errors.New("the group name must not be empty")
 		}
 
-		if m := lb.GetBackendGroupManager(c.Host); m != nil {
-			bg := m.Add(lb.NewBackendGroup(name))
-			return lb.NewGroupBackend(name, &lb.GroupBackendConfig{
-				HealthCheck:  c.HealthCheck,
-				BackendGroup: bg,
-			})
+		if m := lb.DefaultGateway.GetBackendGroupManager(c.Host); m == nil {
+			return nil, fmt.Errorf("no host '%s'", c.Host)
+		} else if group := m.GetBackendGroup(name); group != nil {
+			return group.(lb.Backend), nil
 		}
 
-		return nil, fmt.Errorf("no the backend group named '%s'", c.Host)
+		return nil, fmt.Errorf("no the backend group '%s' below the host '%s'", name, c.Host)
 	}))
 
 	backend.RegisterBuilder(backend.NewBuilder("http", func(c backend.BuilderContext) (lb.Backend, error) {
